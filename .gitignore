@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Terraform (added later, but good to have now)
+.terraform/
+*.tfstate
+*.tfstate.backup
+.terraform.lock.hcl
+
+# AWS credentials - NEVER commit these
+.aws/
+*.pem
+
+# OS/editor junk
+.DS_Store
+.vscode/
