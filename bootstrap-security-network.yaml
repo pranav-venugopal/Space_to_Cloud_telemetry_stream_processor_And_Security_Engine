@@ -1,0 +1,134 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Base Networking, KMS, CloudTrail, and GuardDuty Bootstrap"
+
+#Defining Resources
+Resources:
+  #creating a VPC for Isolated Network for the project.
+  TelemetryVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16 #defines the private IP Address range for this VPC.
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: telemetry-vpc # terraform's data block will look for VPC with this name.
+
+  # creating two Resources of  private subnets, in different availability zones
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref TelemetryVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: telemetry-subnet-a
+        - Key: Type
+          Value: Private
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref TelemetryVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: telemetry-subnet-b
+        - Key: Type
+          Value: Private
+
+  #creating Resource for encryption keys for S3 buckets etc
+  TelemetryKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: "KMS keys for telemetry data and Security Logs"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+
+          - Sid: Allow CloudTrail to Encrypt Logs
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action:
+              - "kms:GenerateDataKey*"
+              - "kms:Decrypt"
+              - "kms:DescribeKey"
+            Resource: "*"
+#Creating Resource Alias for the Kms Key 
+  TelemetryKMSAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+     AliasName: alias/telemetry-key
+     TargetKeyId: !Ref TelemetryKMSKey #!Ref points bact to the resource define above.
+
+#Resource for S3 bucket to store Audit Logs. This is where cloudTrail will dump it's logs in 
+  CloudTrailS3Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+        BucketName: !Sub 'telemetry-audit-logs-${AWS::AccountId}' #bucket names should be globally unique across all of AWS, so I connected it to Account id.
+        PublicAccessBlockConfiguration:
+            BlockPublicAcls: true
+            BlockPublicPolicy: true
+            IgnorePublicAcls: true
+            RestrictPublicBuckets: true
+        BucketEncryption:
+            ServerSideEncryptionConfiguration:
+                - ServerSideEncryptionByDefault:
+                    SSEAlgorithm: aws:kms
+                    KMSMasterKeyID: !Ref TelemetryKMSKey
+
+#Creating a resource for permissions for cloudtrail to write into the bucket
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailS3Bucket 
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+            - Sid: AWSCloudTrailAclCheck
+              Effect: Allow
+              Principal:
+                Service: cloudtrail.amazonaws.com
+              Action: 's3:GetBucketAcl'
+              Resource: !GetAtt CloudTrailS3Bucket.Arn
+
+            - Sid: AWSCloudTrailWrite
+              Effect: Allow
+              Principal:
+                Service: cloudtrail.amazonaws.com
+              Action: 's3:PutObject'
+              Resource: !Sub '${CloudTrailS3Bucket.Arn}/AWSLogs/${AWS::AccountId}/*'
+              Condition:
+                StringEquals:
+                    's3:x-amz-acl': 'bucket-owner-full-control'
+                    'aws:SourceArn': !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/telemetry-audit-trail'
+
+#Creating the audit Trail. This records every API calls anyone makes.
+  GlobalCloudTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: CloudTrailBucketPolicy # this makes the above resource which is the policy to be created before the trail to avoid a race contdition 
+    Properties:
+      TrailName: telemetry-audit-trail
+      S3BucketName: !Ref CloudTrailS3Bucket # tells it where to deliver the log files. the name is in above resource
+      IsLogging: true
+      IncludeGlobalServiceEvents: true #Logs account wide events , not just region-specific ones
+      IsMultiRegionTrail: true #Captures activity across all AWS Regions.
+      EnableLogFileValidation: true #lets me cryptographically prove logs haven't been tampered with
+      KMSKeyId: !Ref TelemetryKMSKey
+
+#Last resource Which is gonna be guard duty. this watches my account's activity and flags suspicious patterns 
+  GuardDutyDetector:
+    Type: AWS::GuardDuty::Detector 
+    Properties:
+      Enable: true
