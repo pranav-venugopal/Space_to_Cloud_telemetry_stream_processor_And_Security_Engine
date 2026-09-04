@@ -126,9 +126,79 @@ Resources:
       IsMultiRegionTrail: true #Captures activity across all AWS Regions.
       EnableLogFileValidation: true #lets me cryptographically prove logs haven't been tampered with
       KMSKeyId: !Ref TelemetryKMSKey
+      CloudWatchLogsLogGroupArn: !GetAtt TelemetryCloudWatchLogGroup.Arn #by adding these both to our global cloud trail resource wer are sending the logs to CloudWatch and to cloudwatch role
+      CloudWatchLogsRoleArn: !GetAtt CloudTrailToCloudWatchRole.Arn 
+
 
 #Last resource Which is gonna be guard duty. this watches my account's activity and flags suspicious patterns 
-  GuardDutyDetector:
-    Type: AWS::GuardDuty::Detector 
+  # GuardDutyDetector:
+  #   Type: AWS::GuardDuty::Detector 
+  #   Properties:
+  #     Enable: true
+#wasn't able to use this since 2025 aws account policy guard duty became a paid plan. 
+
+# the alternative approach to by pass this is by making my own detection system using cloudwatch and cloud trail logs with own filters 
+
+#creating the resource which is an iam role  to make cloud trail and cloudwatch logs into metric filters and alalm me through SNS 
+  CloudTrailToCloudWatchRole: # by creating this cloud trail which was not allowed to send logs to cloud watch (This is Default Policy) folder can now be able to send them the logs.
+    Type: AWS::IAM::Role
     Properties:
-      Enable: true
+      RoleName: telemetry-cloudtrail-cloudwatch-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow # this is the switch.
+            Principal: 
+              Service: cloudtrail.amazonaws.com # here we are allowing cloud trail.
+            Action: 'sts:AssumeRole' # now finally temproarily can send logs.
+      Policies:
+        - PolicyName: CloudTrailCloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream' # gives ability to create new log files/ channels
+                  - 'logs:PutLogEvents' # gives ability to write the trail logs inside those files/ channels
+                Resource: !Sub '${TelemetryCloudWatchLogGroup.Arn}:*' # the above abilities can only be used for the resource below which we created
+#the cloudwatch log group that will recieve a live copy of cloud Trail's events this is the storage file for cloud watch.           
+  TelemetryCloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup 
+    Properties:
+      LogGroupName: /telemetry/cloudtrail-logs 
+      RetentionInDays: 90 #it will stay for 90 days. the logs.then cleard.
+
+# creating metric filter and scanning cloudwatch logs for unauthorised operations 
+  UnauthorizedApiMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref TelemetryCloudWatchLogGroup
+      FilterPattern: '{($.errorCode = "*UnauthorizedOperation*") || ($.errorCode = "AccessDenied*")}'
+      MetricTransformations:
+        - MetricName: UnauthorizedApiCount
+          MetricNamespace: TelemetrySecurity 
+          MetricValue: "1" # metric counter for the alarm threshold to activate if it reaches this count.
+
+#Creating Sns security notification for the alarms
+  SecurityAlertTopic:
+    Type: AWS::SNS::Topic 
+    Properties:
+      TopicName: telemetry-security-alerts #Creates a channel with this name.
+
+#Creating Alarm that fires when unauthorised attempts began 
+  UnauthorizedApiAlerts:
+    Type: AWS::CloudWatch::Alarm 
+    Properties:
+      AlarmName: Telemetry-Alert-UnauthorizedAPICalls 
+      AlarmDescription: 'Triggers when an Unauthorized or access-Denied API calls occur.'
+      MetricName: UnauthorizedApiCount 
+      Namespace: TelemetrySecurity 
+      Statistic: Sum 
+      Period: 300 # Evaluate logs every 5 mins written in seconds.
+      EvaluationPeriods: 1
+      Threshold: 1 
+      ComparisonOperator: GreaterThanOrEqualToThreshold 
+      AlarmActions:
+        - !Ref SecurityAlertTopic  
+
+
